@@ -93,6 +93,7 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
+    eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
@@ -1259,7 +1260,13 @@ def eval_val_sliding_ttt(
                         if hit.any():
                             hi = np.nonzero(hit)[0]
                             aw = args.ngram_alpha_low + (args.ngram_alpha_high - args.ngram_alpha_low) / (1.0 + np.exp(-2.0 * (ent_np[i, s:wlen][hi] - args.ngram_ent_thresh)))
-                            blend_prob[hi] = (1.0 - aw) * neural_prob[hi] + aw * cache_prob[hi]
+                            # PAQ-style log-odds mixing
+                            np_clip = np.clip(neural_prob[hi], 1e-7, 1.0 - 1e-7)
+                            cp_clip = np.clip(cache_prob[hi], 1e-7, 1.0 - 1e-7)
+                            lo_n = np.log(np_clip / (1.0 - np_clip))
+                            lo_c = np.log(cp_clip / (1.0 - cp_clip))
+                            lo_mix = (1.0 - aw) * lo_n + aw * lo_c
+                            blend_prob[hi] = 1.0 / (1.0 + np.exp(-lo_mix))
                         blend_nll = -np.log(np.clip(blend_prob, 1e-12, 1.0))
                         if use_mixer and uni_total >= args.mixer_min_tokens:
                             ck2, fk2 = ngram_hash_keys(val_np, gj, 2, ngram_mask, ngram_primes)
@@ -1587,6 +1594,60 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     CastedLinear._qat_enabled = args.qat_enabled
+
+    # --- EVAL_ONLY mode: skip training, load existing artifact ---
+    if args.eval_only:
+        log0("EVAL_ONLY=1: skipping training, loading final_model.int6.ptz")
+        eval_model = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            mtp_num_heads=0, mtp_loss_weight=0.0,
+            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n,
+            rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
+            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+            gated_attention=args.gated_attention, value_residual=args.value_residual,
+        ).to(device).bfloat16()
+        eval_model.qo_bank.data = eval_model.qo_bank.data.float()
+        eval_model.kv_bank.data = eval_model.kv_bank.data.float()
+        eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
+        eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+        for m in eval_model.modules():
+            if isinstance(m, CastedLinear):
+                m.float()
+        restore_low_dim_params_to_fp32(eval_model)
+        with open("final_model.int6.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
+        # Need a template sd for dequantization
+        template_sd = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
+        unbanked_template = _unbank_state_dict(template_sd, args.num_layers)
+        deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_template)
+        deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, template_sd)
+        eval_model.load_state_dict(deq_state, strict=True)
+        code = Path(__file__).read_text(encoding="utf-8")
+        code_bytes = len(code.encode("utf-8"))
+        quant_file_bytes = len(quant_blob_disk)
+        log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
+        if args.ttt_enabled:
+            torch.cuda.synchronize()
+            t_ttt = time.perf_counter()
+            ttt_loss, ttt_bpb = eval_val_sliding_ttt(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, log0=log0,
+            )
+            torch.cuda.synchronize()
+            log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
+                 f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
+            log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+            log0(f"final_int8_zlib_roundtrip_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        if distributed:
+            dist.destroy_process_group()
+        return
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
