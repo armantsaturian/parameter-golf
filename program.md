@@ -115,7 +115,7 @@ LOOP FOREVER:
 5. Run: `timeout 6000 torchrun --standalone --nproc_per_node=8 train_gpt.py > run.log 2>&1` — or use `EVAL_ONLY=1` with `timeout 3000` for eval-only changes. **Context efficiency**: don't poll the log every few seconds. You may check `tail -5 run.log` once or twice during a run to confirm it's progressing, but sleep 4+ minutes between checks. The run takes ~12-15 min on H100 (full) or ~5-8 min (eval-only) — be patient and conserve context. **Early stopping**: if a mid-run validation (e.g. step 4000) is significantly worse than your current best (say >0.05 bpb behind), consider killing the run (`pkill -f torchrun`) and moving on — but use your judgment, some techniques recover during TTT/eval.
 6. Parse: `grep "final_int8_zlib_roundtrip_exact\|Total submission size" run.log`
 7. If grep is empty, it crashed. `tail -n 50 run.log` to diagnose. Typo/import -> fix and re-run. OOM/fundamental -> log as crash, revert, move on. Give up after 2-3 fix attempts.
-8. Record results in `results.tsv` (do NOT commit it).
+8. Record results in `results.tsv`. **Commit and push results.tsv after every experiment** — if the instance dies, the experiment history must survive.
 9. **Decision:**
    - bpb improved AND artifact <= 16MB -> **keep**, advance the branch.
    - bpb improved but artifact > 16MB -> **revert** code, but log as `invalid` in results.tsv.
