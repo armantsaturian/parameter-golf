@@ -65,7 +65,7 @@ Artifact = compressed model bytes + code bytes (`train_gpt.py` UTF-8 size). A ru
 - Change data/tokenizer files in `./data/`.
 - Run for longer than 10 minutes of training wall time (on H100; V100 mode ignores wallclock).
 
-**Where to find ideas:** Read `levers.md` for a quick reference of competitive techniques. Study the SOTA submissions in `records/` for full implementations. When stuck, think harder — try combining near-misses, try radical changes, re-read the records for new angles.
+**Where to find ideas:** Read `levers.md` for a reference of what competitors are doing — use it as inspiration, not a checklist. You are free to try any technique you believe could improve bpb. Don't limit yourself to what's listed there. Think about what's widely known to improve LLMs in the broader ML community (new activations, attention variants, training tricks, quantization methods, etc.) — if it's proven elsewhere but hasn't been tried in this competition yet, it's a great candidate. Also actively try **combining** multiple techniques together — individual levers might give small gains, but stacking them is how you reach sub-1.0. Study the SOTA submissions in `records/` for full implementations when you need concrete code to reference.
 
 ## The experiment loop
 
