@@ -227,6 +227,17 @@ def build_html():
             c["hash"], c["message"], c["date"][:19]
         )
 
+    # Compute running best (minimum bpb among kept experiments so far)
+    all_with_bpb = [e for e in experiments if e["val_bpb"]]
+    best_so_far_x = []
+    best_so_far_y = []
+    running_min = float("inf")
+    for e in experiments:
+        if e["val_bpb"] and e["status"] == "keep":
+            running_min = min(running_min, e["val_bpb"])
+            best_so_far_x.append(e["idx"])
+            best_so_far_y.append(running_min)
+
     # All chart data as JSON to inject safely
     chart_data = json.dumps({
         "keep": {"x": [e["idx"] for e in keep_exps], "y": [e["val_bpb"] for e in keep_exps],
@@ -234,6 +245,10 @@ def build_html():
         "discard": {"x": [e["idx"] for e in discard_exps], "y": [e["val_bpb"] for e in discard_exps],
                     "text": [e["description"][:50] for e in discard_exps]},
         "invalid": {"x": [e["idx"] for e in invalid_exps], "y": [e["val_bpb"] for e in invalid_exps]},
+        "all_bpb": {"x": [e["idx"] for e in all_with_bpb], "y": [e["val_bpb"] for e in all_with_bpb],
+                    "text": [e["description"][:50] for e in all_with_bpb],
+                    "status": [e["status"] for e in all_with_bpb]},
+        "best_so_far": {"x": best_so_far_x, "y": best_so_far_y},
         "train": {"x": [s["step"] for s in run_data["train_steps"]],
                   "y": [s["loss"] for s in run_data["train_steps"]]},
         "val": {"x": [v["step"] for v in run_data["val_checks"]],
@@ -371,16 +386,30 @@ var lb = {paper_bgcolor: plotBg, plot_bgcolor: plotBg, font: {color: plotText, s
   xaxis: {gridcolor: plotGrid, zerolinecolor: plotGrid},
   yaxis: {gridcolor: plotGrid, zerolinecolor: plotGrid}};
 
-// Experiment timeline
+// Color map for all experiments by status
+var statusColors = D.all_bpb.status.map(function(s) {
+  if (s === 'keep') return '#10b981';
+  if (s === 'discard') return '#ef4444';
+  if (s === 'invalid') return '#8b5cf6';
+  if (s === 'crash') return '#f59e0b';
+  return '#64748b';
+});
+var statusSymbols = D.all_bpb.status.map(function(s) {
+  if (s === 'keep') return 'circle';
+  if (s === 'discard') return 'x';
+  if (s === 'invalid') return 'diamond';
+  return 'triangle-up';
+});
+
+// Experiment timeline — ALL experiments + best-so-far line
 Plotly.newPlot('exp-timeline', [
-  {x: D.keep.x, y: D.keep.y, text: D.keep.text, mode: 'lines+markers', name: 'Kept',
-   marker: {color: '#10b981', size: 10}, line: {color: '#10b981', width: 2},
-   hovertemplate: '%%{text}<br>BPB: %%{y:.4f}'},
-  {x: D.discard.x, y: D.discard.y, text: D.discard.text, mode: 'markers', name: 'Discarded',
-   marker: {color: '#ef4444', size: 8, symbol: 'x'},
-   hovertemplate: '%%{text}<br>BPB: %%{y:.4f}'},
-  {x: D.invalid.x, y: D.invalid.y, mode: 'markers', name: 'Invalid (>16MB)',
-   marker: {color: '#8b5cf6', size: 8, symbol: 'diamond'}},
+  {x: D.all_bpb.x, y: D.all_bpb.y, text: D.all_bpb.text, customdata: D.all_bpb.status,
+   mode: 'markers', name: 'All Experiments',
+   marker: {color: statusColors, size: 9, symbol: statusSymbols, line: {width: 1, color: '#1e293b'}},
+   hovertemplate: '%%{text}<br>BPB: %%{y:.4f}<br>Status: %%{customdata}'},
+  {x: D.best_so_far.x, y: D.best_so_far.y, mode: 'lines+markers', name: 'Best So Far',
+   marker: {color: '#22d3ee', size: 7, symbol: 'star'}, line: {color: '#22d3ee', width: 3},
+   hovertemplate: 'Best: %%{y:.4f}'},
 ], Object.assign({}, lb, {
   xaxis: Object.assign({}, lb.xaxis, {title: 'Experiment #'}),
   yaxis: Object.assign({}, lb.yaxis, {title: 'val_bpb'}),
