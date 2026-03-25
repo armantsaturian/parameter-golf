@@ -75,8 +75,8 @@ LOOP FOREVER:
 2. Pick an experiment idea. One change at a time — isolate variables.
 3. Edit `train_gpt.py`.
 4. git commit (so you can revert cleanly), then `git push origin HEAD` to back up to GitHub. **Always push after every commit** — if the instance dies, unpushed work is lost. Commit message format: `exp: <description> [bpb=X.XXXX, size=XX.XXmb, STATUS]` — e.g. `exp: add n-gram cache at eval [bpb=1.0508, size=15.92mb, keep]`. For pre-run commits use `exp: <description> [pending]`.
-5. Run: `timeout 6000 torchrun --standalone --nproc_per_node=8 train_gpt.py > run.log 2>&1`
-6. Parse: `grep "final_int8_zlib_roundtrip_exact\|Total submission size" run.log`
+5. Run: `timeout 6000 torchrun --standalone --nproc_per_node=8 train_gpt.py > run.log 2>&1` — **DO NOT read or tail run.log while training is running.** This wastes context. Just wait for the command to finish. The run takes ~12-15 min on H100. Be patient.
+6. Parse: `grep "final_int8_zlib_roundtrip_exact\|Total submission size" run.log` — only read the log AFTER the run completes.
 7. If grep is empty, it crashed. `tail -n 50 run.log` to diagnose. Typo/import -> fix and re-run. OOM/fundamental -> log as crash, revert, move on. Give up after 2-3 fix attempts.
 8. Record results in `results.tsv` (do NOT commit it).
 9. **Decision:**
