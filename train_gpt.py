@@ -106,6 +106,7 @@ class Hyperparameters:
     ngram_alpha_low = float(os.environ.get("NGRAM_ALPHA_LOW", 0.05))
     ngram_alpha_high = float(os.environ.get("NGRAM_ALPHA_HIGH", 0.40))
     ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", 4.0))
+    ngram_backoff_beta = float(os.environ.get("NGRAM_BACKOFF_BETA", 1.0))
     use_mixer = bool(int(os.environ.get("USE_MIXER", "1")))
     mixer_eta = float(os.environ.get("MIXER_ETA", 0.1))
     mixer_min_tokens = int(os.environ.get("MIXER_MIN_TOKENS", 10000))
@@ -1149,17 +1150,18 @@ def eval_val_sliding_ttt(
         ngram_primes = np.array([np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929), np.uint64(131071)], dtype=np.uint64)
         ngram_ctx = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
         ngram_full = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
-        log0(f"ttt_sliding:ngram order={args.ngram_order} alpha=[{args.ngram_alpha_low},{args.ngram_alpha_high}] ent={args.ngram_ent_thresh}")
+        log0(f"ttt_sliding:ngram order={args.ngram_order} alpha=[{args.ngram_alpha_low},{args.ngram_alpha_high}] ent={args.ngram_ent_thresh} backoff_beta={args.ngram_backoff_beta}")
     use_mixer = args.use_mixer and ngram_ctx is not None and 2 in ngram_orders
     mixer_log_w = None
     mixer_labels = ("blend", "neural", "unigram", "bigram", "entropy")
     uni_counts = None
     uni_total = 0
     uniform_nll = math.log(args.vocab_size)
+    if ngram_ctx is not None:
+        uni_counts = np.zeros(args.vocab_size, dtype=np.uint32)
     if use_mixer:
         mixer_log_w = np.zeros(len(mixer_labels), dtype=np.float64)
         mixer_log_w[0] = 2.0
-        uni_counts = np.zeros(args.vocab_size, dtype=np.uint32)
         log0(f"ttt_sliding:mixer eta={args.mixer_eta} min_tokens={args.mixer_min_tokens}")
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -1233,29 +1235,33 @@ def eval_val_sliding_ttt(
                         snll = nll_np[i, s:wlen].astype(np.float64, copy=True)
                         neural_prob = np.exp(-snll)
                         blend_prob = neural_prob.copy()
-                        cache_prob = np.zeros(wlen - s, dtype=np.float64)
+                        if targets_np is None:
+                            targets_np = val_np[gj]
+                        uni_prob = (uni_counts[targets_np].astype(np.float64) + 0.1) / (uni_total + 0.1 * args.vocab_size)
+                        cache_prob = uni_prob.copy()
                         hit = np.zeros(wlen - s, dtype=np.bool_)
-                        for n in reversed(ngram_orders):
-                            valid = (gj >= n - 1) & ~hit
+                        for n in ngram_orders:
+                            valid = gj >= n - 1
                             if not valid.any():
                                 continue
                             vi = np.nonzero(valid)[0]
                             ck, fk = ngram_hash_keys(val_np, gj[vi], n, ngram_mask, ngram_primes)
                             cc = ngram_ctx[n][ck].astype(np.float64)
                             fc = ngram_full[n][fk].astype(np.float64)
-                            seen = cc >= 2.0
-                            if seen.any():
-                                mi = vi[seen]
-                                cache_prob[mi] = np.clip(np.minimum(fc[seen], cc[seen]) / np.maximum(cc[seen], 1.0), 0.0, 1.0)
-                                hit[mi] = True
+                            prev = cache_prob[vi]
+                            cache_prob[vi] = np.clip(
+                                (np.minimum(fc, cc) + args.ngram_backoff_beta * prev) /
+                                (cc + args.ngram_backoff_beta),
+                                0.0,
+                                1.0,
+                            )
+                            hit[vi] |= cc >= 2.0
                         if hit.any():
                             hi = np.nonzero(hit)[0]
                             aw = args.ngram_alpha_low + (args.ngram_alpha_high - args.ngram_alpha_low) / (1.0 + np.exp(-2.0 * (ent_np[i, s:wlen][hi] - args.ngram_ent_thresh)))
                             blend_prob[hi] = (1.0 - aw) * neural_prob[hi] + aw * cache_prob[hi]
                         blend_nll = -np.log(np.clip(blend_prob, 1e-12, 1.0))
                         if use_mixer and uni_total >= args.mixer_min_tokens:
-                            targets_np = val_np[gj]
-                            uni_prob = (uni_counts[targets_np].astype(np.float64) + 0.1) / (uni_total + 0.1 * args.vocab_size)
                             ck2, fk2 = ngram_hash_keys(val_np, gj, 2, ngram_mask, ngram_primes)
                             cc2 = ngram_ctx[2][ck2].astype(np.float64)
                             fc2 = ngram_full[2][fk2].astype(np.float64)
@@ -1284,11 +1290,10 @@ def eval_val_sliding_ttt(
                     tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     byte_count += tb.sum()
                     if ngram_ctx is not None and gj is not None:
-                        if use_mixer:
-                            if targets_np is None:
-                                targets_np = val_np[gj]
-                            np.add.at(uni_counts, targets_np, 1)
-                            uni_total += targets_np.size
+                        if targets_np is None:
+                            targets_np = val_np[gj]
+                        np.add.at(uni_counts, targets_np, 1)
+                        uni_total += targets_np.size
                         for n in ngram_orders:
                             valid = gj >= n - 1
                             if not valid.any():
