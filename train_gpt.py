@@ -81,7 +81,7 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
@@ -101,6 +101,11 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
+    ngram_order = int(os.environ.get("NGRAM_ORDER", 5))
+    ngram_alpha_low = float(os.environ.get("NGRAM_ALPHA_LOW", 0.05))
+    ngram_alpha_high = float(os.environ.get("NGRAM_ALPHA_HIGH", 0.40))
+    ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", 4.0))
 
 
 def causal_flash_or_sdpa(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
@@ -114,6 +119,15 @@ def causal_flash_or_sdpa(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         enable_gqa=(q.size(2) != k.size(2)),
     )
     return y.transpose(1, 2)
+
+def ngram_hash_keys(tokens_np: np.ndarray, pos: np.ndarray, order: int, mask: np.uint64, primes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    ctx = order - 1
+    h = np.zeros(pos.size, dtype=np.uint64)
+    for k in range(ctx):
+        h ^= tokens_np[pos - (ctx - k)].astype(np.uint64) * primes[k % 5]
+    ctx_idx = (h & mask).astype(np.int64)
+    full_idx = ((h ^ (tokens_np[pos].astype(np.uint64) * primes[ctx % 5])) & mask).astype(np.int64)
+    return ctx_idx, full_idx
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1119,6 +1133,17 @@ def eval_val_sliding_ttt(
          f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
          f"freeze_blocks={args.ttt_freeze_blocks}")
 
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    val_np = val_tokens.numpy()
+    ngram_orders = list(range(2, args.ngram_order + 1))
+    ngram_ctx = ngram_full = ngram_mask = ngram_primes = None
+    if args.ngram_enabled and args.ngram_order >= 2:
+        ngram_mask = np.uint64((1 << 22) - 1)
+        ngram_primes = np.array([np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929), np.uint64(131071)], dtype=np.uint64)
+        ngram_ctx = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
+        ngram_full = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
+        log0(f"ttt_sliding:ngram order={args.ngram_order} alpha=[{args.ngram_alpha_low},{args.ngram_alpha_high}] ent={args.ngram_ent_thresh}")
+
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1172,21 +1197,57 @@ def eval_val_sliding_ttt(
                     x_batch[i, :wlen] = chunk_tok[:-1]
                     y_batch[i, :wlen] = chunk_tok[1:]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = base_model.forward_logits(x_batch)
-                nll = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)).float(),
-                    y_batch.reshape(-1), reduction="none",
-                ).reshape(bsz, seq_len)
+                    logits = compiled_logits(x_batch)
+                flat_logits = logits.reshape(-1, logits.size(-1)).float()
+                nll = F.cross_entropy(flat_logits, y_batch.reshape(-1), reduction="none").reshape(bsz, seq_len)
+                nll_np = ent_np = None
+                if ngram_ctx is not None:
+                    lp = F.log_softmax(flat_logits, dim=-1)
+                    nll_np = nll.cpu().numpy()
+                    ent_np = (-(lp.exp() * lp).sum(dim=-1).reshape(bsz, seq_len).cpu().numpy().astype(np.float64, copy=False))
                 for i, ws in enumerate(batch_ws):
                     wlen = wlens[i]
                     s = 0 if ws == 0 else max(wlen - stride, 0)
-                    scored_nll = nll[i, s:wlen].to(torch.float64)
-                    loss_sum += scored_nll.sum()
+                    gj = None
+                    if ngram_ctx is not None and wlen > s:
+                        gj = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
+                        snll = nll_np[i, s:wlen].astype(np.float64, copy=True)
+                        smp = np.exp(-snll)
+                        bp = np.zeros(wlen - s, dtype=np.float64)
+                        hit = np.zeros(wlen - s, dtype=np.bool_)
+                        for n in reversed(ngram_orders):
+                            valid = (gj >= n - 1) & ~hit
+                            if not valid.any():
+                                continue
+                            vi = np.nonzero(valid)[0]
+                            ck, fk = ngram_hash_keys(val_np, gj[vi], n, ngram_mask, ngram_primes)
+                            cc = ngram_ctx[n][ck].astype(np.float64)
+                            fc = ngram_full[n][fk].astype(np.float64)
+                            seen = cc >= 2.0
+                            if seen.any():
+                                mi = vi[seen]
+                                bp[mi] = np.clip(np.minimum(fc[seen], cc[seen]) / np.maximum(cc[seen], 1.0), 0.0, 1.0)
+                                hit[mi] = True
+                        if hit.any():
+                            hi = np.nonzero(hit)[0]
+                            aw = args.ngram_alpha_low + (args.ngram_alpha_high - args.ngram_alpha_low) / (1.0 + np.exp(-2.0 * (ent_np[i, s:wlen][hi] - args.ngram_ent_thresh)))
+                            smp[hi] = (1.0 - aw) * smp[hi] + aw * bp[hi]
+                        loss_sum += float((-np.log(np.clip(smp, 1e-12, 1.0))).sum())
+                    else:
+                        loss_sum += nll[i, s:wlen].to(torch.float64).sum()
                     token_count += float(wlen - s)
                     tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
                     tb = base_bytes_lut[tgt].to(torch.float64)
                     tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     byte_count += tb.sum()
+                    if ngram_ctx is not None and gj is not None:
+                        for n in ngram_orders:
+                            valid = gj >= n - 1
+                            if not valid.any():
+                                continue
+                            ck, fk = ngram_hash_keys(val_np, gj[valid], n, ngram_mask, ngram_primes)
+                            np.add.at(ngram_ctx[n], ck, 1)
+                            np.add.at(ngram_full[n], fk, 1)
 
         # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
         is_last_chunk = (ci == num_chunks - 1)
@@ -1908,6 +1969,7 @@ def main() -> None:
         log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
              f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
         log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
