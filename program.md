@@ -27,13 +27,15 @@ This is a CONSTRAINED optimization problem:
 
 Artifact = compressed model bytes + code bytes (`train_gpt.py` UTF-8 size). A run that improves bpb but exceeds 16MB is **invalid**. Track both metrics on every run. The `train_gpt.py` file itself counts toward the 16MB — keep it tight.
 
-**Competitive landscape** (Mar 25, 2026):
-- Our starting baseline: **1.1194** (11L, LeakyReLU², XSA4, EMA, GPTQ-lite, Partial RoPE, LN Scale, Legal TTT, Parallel Muon)
+**Competitive landscape** (Mar 25, 2026 evening):
+- Our current best: **0.9884** (Hedge Mixer + backed-off 2-5gram cache + XSA-all, commit 6791de1)
 - Best open PR: **0.9850** (Cosine TTT + Multi-Order N-gram Cache, PR #741)
-- Sub-1.1 cluster: **1.0222** (XSA-all + Depth Recurrence + Hedge Mixer TTT, PR #745), **1.0909** (9L XSA-all + 5-gram cache, PR #740)
+- Gap to close: **0.0034 bpb**
+- The mixer blend=1.000 means the n-gram cache is doing ALL the work. Focus on improving cache/mixing quality.
 - PR #611 (0.5601, LoRA TTT) was **REJECTED** — min-NLL epoch selection ruled as training on val set. Do NOT use min-NLL epoch selection.
-- The frontier has shifted to **eval-time n-gram caching** and **multi-expert mixing** during TTT. Read `levers.md` URGENT section for details.
-- Val-TTT is legal per competition rules: you may test-time train on validation tokens you've already evaluated. But you must score tokens BEFORE weight updates.
+- PR #762 (0.7139, multi-epoch LoRA TTT) is also likely invalid — same information leakage principle.
+- **DO NOT** implement multi-pass replay (score all tokens, then re-score with populated cache). This is information leakage.
+- Val-TTT is legal per competition rules: you may test-time train on validation tokens you've already evaluated. But you must score tokens BEFORE weight updates. Single-pass only.
 
 ## Hardware modes
 
@@ -67,6 +69,41 @@ Artifact = compressed model bytes + code bytes (`train_gpt.py` UTF-8 size). A ru
 
 **Where to find ideas:** Read `levers.md` for a reference of what competitors are doing — use it as inspiration, not a checklist. You are free to try any technique you believe could improve bpb. Don't limit yourself to what's listed there. Think about what's widely known to improve LLMs in the broader ML community (new activations, attention variants, training tricks, quantization methods, etc.) — if it's proven elsewhere but hasn't been tried in this competition yet, it's a great candidate. Also actively try **combining** multiple techniques together — individual levers might give small gains, but stacking them is how you reach sub-1.0. Study the SOTA submissions in `records/` for full implementations when you need concrete code to reference.
 
+## EVAL-ONLY mode (critical for fast iteration)
+
+If your experiment ONLY changes eval/TTT/cache/mixing code and does NOT change the model architecture, training loop, optimizer, or quantization, you do NOT need to retrain. This saves ~10 minutes per experiment.
+
+**How it works:**
+1. Add an `EVAL_ONLY` env var check near the top of `train_gpt.py`'s main block.
+2. When `EVAL_ONLY=1`, skip training entirely — load the existing `final_model.int6.ptz` artifact directly.
+3. Jump straight to the eval/TTT/cache code path.
+4. The saved artifact from the last kept training run must exist as `final_model.int6.ptz` in the repo root.
+
+**When to use EVAL_ONLY:**
+- Cache/mixing changes (PAQ-style mixing, PPM exclusion, extended n-grams, SSE, temperature calibration)
+- TTT hyperparameter changes (LR, epochs, chunk size)
+- Blending/interpolation formula changes
+- Any change that only touches code AFTER the model is loaded from the artifact
+
+**When NOT to use EVAL_ONLY:**
+- Architecture changes (layers, dims, activations, attention)
+- Training hyperparameters (LR, optimizer, batch size, warmdown)
+- Quantization changes (int5, CROWN-Q, Soft-Round QAT)
+- Any change that affects the trained weights
+
+**Run command for eval-only:**
+```
+EVAL_ONLY=1 timeout 3000 torchrun --standalone --nproc_per_node=8 train_gpt.py > run.log 2>&1
+```
+
+Each eval-only run takes ~5-8 min instead of ~15 min. This doubles your experiment throughput for eval-time techniques.
+
+## LEGALITY WARNING: No multi-pass replay
+
+**DO NOT** implement a "phase 2 cache replay" where you score all tokens in phase 1 (building an n-gram cache), then replay and re-score all tokens with the populated cache. This is **information leakage** — the cache in phase 2 contains statistics from tokens that haven't been scored yet in that pass. This is the same principle that got PR #611 rejected. Any result from a replay approach is INVALID.
+
+Legal approach: single-pass, score-before-update. When scoring token X, the cache must only contain statistics from tokens scored BEFORE X in this pass.
+
 ## The experiment loop
 
 LOOP FOREVER:
@@ -75,7 +112,7 @@ LOOP FOREVER:
 2. Pick an experiment idea. One change at a time — isolate variables.
 3. Edit `train_gpt.py`.
 4. git commit (so you can revert cleanly), then `git push origin HEAD` to back up to GitHub. **Always push after every commit** — if the instance dies, unpushed work is lost. Commit message format: `exp: <description> [bpb=X.XXXX, size=XX.XXmb, STATUS]` — e.g. `exp: add n-gram cache at eval [bpb=1.0508, size=15.92mb, keep]`. For pre-run commits use `exp: <description> [pending]`.
-5. Run: `timeout 6000 torchrun --standalone --nproc_per_node=8 train_gpt.py > run.log 2>&1` — **Context efficiency**: don't poll the log every few seconds. You may check `tail -5 run.log` once or twice during a run to confirm it's progressing, but sleep 4+ minutes between checks. The run takes ~12-15 min on H100 — be patient and conserve context. **Early stopping**: if a mid-run validation (e.g. step 4000) is significantly worse than your current best (say >0.05 bpb behind), consider killing the run (`pkill -f torchrun`) and moving on — but use your judgment, some techniques recover during TTT/eval.
+5. Run: `timeout 6000 torchrun --standalone --nproc_per_node=8 train_gpt.py > run.log 2>&1` — or use `EVAL_ONLY=1` with `timeout 3000` for eval-only changes. **Context efficiency**: don't poll the log every few seconds. You may check `tail -5 run.log` once or twice during a run to confirm it's progressing, but sleep 4+ minutes between checks. The run takes ~12-15 min on H100 (full) or ~5-8 min (eval-only) — be patient and conserve context. **Early stopping**: if a mid-run validation (e.g. step 4000) is significantly worse than your current best (say >0.05 bpb behind), consider killing the run (`pkill -f torchrun`) and moving on — but use your judgment, some techniques recover during TTT/eval.
 6. Parse: `grep "final_int8_zlib_roundtrip_exact\|Total submission size" run.log`
 7. If grep is empty, it crashed. `tail -n 50 run.log` to diagnose. Typo/import -> fix and re-run. OOM/fundamental -> log as crash, revert, move on. Give up after 2-3 fix attempts.
 8. Record results in `results.tsv` (do NOT commit it).
@@ -88,7 +125,7 @@ LOOP FOREVER:
 
    **Important**: always log every experiment in results.tsv before reverting, so you never retry the same idea. Check results.tsv before starting a new experiment to avoid duplicates.
 
-On V100, each run takes ~60-80 min. On H100, ~12-15 min. If a run exceeds 2x expected time, kill it and treat as crash.
+On V100, each run takes ~60-80 min. On H100, ~12-15 min (full) or ~5-8 min (eval-only). If a run exceeds 2x expected time, kill it and treat as crash.
 
 ## Logging results
 
