@@ -27,13 +27,13 @@ This is a CONSTRAINED optimization problem:
 
 Artifact = compressed model bytes + code bytes (`train_gpt.py` UTF-8 size). A run that improves bpb but exceeds 16MB is **invalid**. Track both metrics on every run. The `train_gpt.py` file itself counts toward the 16MB — keep it tight.
 
-**Competitive landscape** (Mar 24, 2026):
+**Competitive landscape** (Mar 25, 2026):
 - Our starting baseline: **1.1194** (11L, LeakyReLU², XSA4, EMA, GPTQ-lite, Partial RoPE, LN Scale, Legal TTT, Parallel Muon)
-- Best no-TTT (open PRs): **1.1154** (XSA all layers + selective pruning, PR #609)
-- Best light TTT (merged): **1.1194** (SGD 3ep, leaderboard SOTA)
-- Best LoRA TTT (open PRs): **0.5601** (K-LoRA + min-NLL epoch selection, PR #611)
-- The frontier is LoRA TTT. The competition has split: base model (~1.115) vs TTT race (~0.56).
-- Val-TTT is legal per competition rules: you may test-time train on validation tokens you've already evaluated.
+- Best open PR: **0.9850** (Cosine TTT + Multi-Order N-gram Cache, PR #741)
+- Sub-1.1 cluster: **1.0222** (XSA-all + Depth Recurrence + Hedge Mixer TTT, PR #745), **1.0909** (9L XSA-all + 5-gram cache, PR #740)
+- PR #611 (0.5601, LoRA TTT) was **REJECTED** — min-NLL epoch selection ruled as training on val set. Do NOT use min-NLL epoch selection.
+- The frontier has shifted to **eval-time n-gram caching** and **multi-expert mixing** during TTT. Read `levers.md` URGENT section for details.
+- Val-TTT is legal per competition rules: you may test-time train on validation tokens you've already evaluated. But you must score tokens BEFORE weight updates.
 
 ## Hardware modes
 

@@ -1,8 +1,49 @@
 # Competitive Levers
 
-Quick reference of techniques used by top leaderboard entries. Updated Mar 24, 2026.
+Quick reference of techniques used by top leaderboard entries. Updated Mar 25, 2026.
 
-Current leaderboard SOTA: **1.1194** (#549). Open PR frontier: **0.5601** (#611, LoRA TTT).
+Current leaderboard SOTA: **1.1194** (#549). Open PR frontier: **0.9850** (#741, Cosine TTT + N-gram Cache).
+
+> **PR #611 (0.5601, LoRA TTT) was REJECTED** — min-NLL epoch selection ruled as training on val set. That path is dead. The new frontier is eval-time n-gram caching + improved TTT.
+
+## URGENT: Highest-Impact New Techniques (Mar 25)
+
+These are from the latest open PRs. Implement in priority order.
+
+### 1. Multi-Order N-gram Cache (PR #741 — 0.9850 bpb)
+Eval-time technique. After model scores a chunk, blend predictions with 2-5gram statistics:
+- Sliding window over eval tokens, build n-gram frequency tables
+- Entropy-adaptive interpolation: when model is uncertain, lean more on n-gram cache
+- Weight: `alpha * model_prob + (1-alpha) * ngram_prob`, alpha adapts per-token
+- Two-phase eval: Phase 1 = Cosine TTT ~330s, Phase 2 = n-gram cache ~150s
+- **Legal**: eval-time only, no training data access
+- Worth **-0.13 bpb** over baseline TTT. This is the single biggest lever right now.
+
+### 2. XSA on ALL Layers (PRs #745, #740 — confirmed by multiple teams)
+Extend cross-sequence attention from last-4 to all 11 layers. Multiple open PRs validate this works.
+- Free **-0.004 bpb** with no artifact size increase.
+- Already in our priority list but now confirmed across teams.
+
+### 3. Hedge Mixer TTT (PR #745 — 1.0222 bpb)
+Online mixing of 5 experts during TTT eval via Hedge algorithm:
+- Expert 1: neural model predictions
+- Expert 2-4: unigram/bigram/trigram caches
+- Expert 5: entropy-based predictor
+- Hedge algorithm updates mixture weights per-token based on each expert's loss
+- Worth **-0.10 bpb** over single-expert TTT
+
+### 4. Depth Recurrence (PR #745 — now working)
+Reuse layers 4-5 to create 13 virtual layers from 11 physical layers.
+- Earlier attempts (#319, #386) got 1.27-1.41 — not competitive.
+- PR #745 makes it work as part of a combined approach (1.0222 bpb).
+- Free extra depth within same artifact budget.
+
+### 5. CROWN-Q Quantization (PR #745)
+Curvature-weighted quantization penalty during warmdown phase.
+- Replaces naive STE-based QAT with Hessian-informed rounding decisions.
+- Complementary to Full Hessian GPTQ.
+
+---
 
 ## Table Stakes (already in SOTA baseline 1.1194)
 
@@ -29,12 +70,11 @@ All of these are in the current best submission. Don't re-implement — they're 
 
 ## Tier 1: Biggest Remaining Levers
 
-**LoRA TTT** — THE dominant lever. PR #611 gets **0.5601 bpb** using LoRA adapters during test-time training. Key details:
-- Add LoRA to K projections (not just Q/V) with 0.3x LR multiplier
-- **Min-NLL epoch selection**: track min NLL per document across TTT epochs, use best epoch's scores (prevents late-epoch overfitting)
-- 8+ epochs of LoRA adaptation per chunk
-- Worth **-0.20 to -0.55 bpb** over no-TTT baseline
-- See PRs #611 (0.56), #596 (0.64), #614 (0.69)
+**N-gram Cache at Eval** — THE dominant new lever. PR #741 gets **0.9850 bpb**. Blend model predictions with 2-5gram statistics during evaluation. See URGENT section above for details.
+
+**Hedge Mixer / Multi-Expert TTT** — PR #745 gets **1.0222 bpb**. Online mixing of neural + n-gram experts. See URGENT section above.
+
+**LoRA TTT (CAUTION)** — Still powerful but **min-NLL epoch selection is ILLEGAL** (PR #611 rejected). Legal LoRA TTT: score tokens BEFORE weight updates, single-pass. PRs #596 (0.64), #614 (0.69) may still be valid if they don't use min-NLL.
 
 **Multi-Pass Streaming TTT** — PR #573 gets **1.0523 bpb** without LoRA. 3 independent adaptation trajectories with shifted data orderings, take min(NLL) per token. Simpler than LoRA TTT. Worth -0.07 bpb over single-pass TTT.
 
@@ -72,14 +112,16 @@ All of these are in the current best submission. Don't re-implement — they're 
 
 Starting from 1.1194 SOTA baseline:
 
-1. **LoRA TTT** — Add LoRA adapters to Q/K/V projections. Min-NLL epoch selection. This is the path to sub-1.0 bpb. Study PRs #611, #596.
-2. **Multi-pass streaming TTT** — 3 trajectories, min NLL/token. Simpler than LoRA, gets ~1.05. Study PR #573.
-3. **XSA all layers** — Extend from last-4 to all 11. Free -0.004 bpb. Study PR #609.
-4. **Full Hessian GPTQ** — Replace naive int6 rounding. Free -0.002 to -0.005 bpb. Study PR #593.
-5. **SwiGLU FFN** — Biggest base-model architecture lever remaining. ~-0.01 bpb.
-6. **int5 quantization** — More params in same bytes. Enables 33.6M params.
-7. **BigramHash 3072x80** — Narrow + wide table. ~-0.001 bpb.
-8. **Combine best of above** — LoRA TTT + SwiGLU + full GPTQ + int5 is likely the path to 0.5x.
+1. **N-gram cache at eval** — Blend model predictions with 2-5gram statistics. THE biggest single lever (-0.13 bpb). Study PR #741.
+2. **XSA all layers** — Extend from last-4 to all 11. Confirmed by multiple teams. Free -0.004 bpb. Study PRs #745, #740, #609.
+3. **Hedge Mixer / multi-expert TTT** — Online mixing of neural + n-gram experts. Study PR #745.
+4. **Depth Recurrence** — Reuse layers 4-5 for virtual depth. Free capacity. Study PR #745.
+5. **Multi-pass streaming TTT** — 3 trajectories, min NLL/token. ~1.05. Study PR #573.
+6. **CROWN-Q quantization** — Curvature-weighted quant penalty during warmdown. Study PR #745.
+7. **Full Hessian GPTQ** — Second-order quantization. Free -0.002 to -0.005 bpb. Study PR #593.
+8. **SwiGLU FFN** — Gated FFN variant. ~-0.01 bpb. Study PR #462.
+9. **int5 quantization** — More params in same bytes. Enables 33.6M params.
+10. **Combine best of above** — N-gram cache + XSA-all + Hedge Mixer + depth recurrence is the path to sub-1.0.
 
 ## V100 Compatibility Notes
 
