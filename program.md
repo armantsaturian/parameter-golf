@@ -81,9 +81,12 @@ LOOP FOREVER:
 8. Record results in `results.tsv` (do NOT commit it).
 9. **Decision:**
    - bpb improved AND artifact <= 16MB -> **keep**, advance the branch.
-   - bpb improved but artifact > 16MB -> **invalid**, `git reset --hard HEAD~1`.
-   - bpb equal or worse -> **discard**, `git reset --hard HEAD~1`.
-   - crashed -> **crash**, revert and move on.
+   - bpb improved but artifact > 16MB -> **revert** code, but log as `invalid` in results.tsv.
+   - bpb equal or worse -> **revert** code, but log as `discard` in results.tsv.
+   - early-stopped (killed mid-run) -> **revert** code, but log as `early-stop` in results.tsv with the partial metric if available.
+   - crashed -> **revert** code, log as `crash`.
+
+   **Important**: always log every experiment in results.tsv before reverting, so you never retry the same idea. Check results.tsv before starting a new experiment to avoid duplicates.
 
 On V100, each run takes ~60-80 min. On H100, ~12-15 min. If a run exceeds 2x expected time, kill it and treat as crash.
 
