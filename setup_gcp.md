@@ -86,8 +86,12 @@ RUN_ID=baseline_sp1024 \
 DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
 TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
 VOCAB_SIZE=1024 \
-torchrun --standalone --nproc_per_node=8 train_gpt.py
+./launch_train_gcp_h100.sh
 ```
+
+The `launch_train_gcp_h100.sh` wrapper clears the `nccl-gib` environment that some Deep Learning VM images inject by default. On `a3-highgpu-8g` H100 instances, raw `torchrun` can otherwise fail during `init_process_group` with `ncclInvalidUsage ... Error: network gIB not found`.
+
+For a full write-up of the issue and resolution, see [gcp_nccl_gib_fix.md](gcp_nccl_gib_fix.md).
 
 ## Running Autoresearch
 
