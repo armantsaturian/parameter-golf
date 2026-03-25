@@ -106,6 +106,9 @@ class Hyperparameters:
     ngram_alpha_low = float(os.environ.get("NGRAM_ALPHA_LOW", 0.05))
     ngram_alpha_high = float(os.environ.get("NGRAM_ALPHA_HIGH", 0.40))
     ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", 4.0))
+    use_mixer = bool(int(os.environ.get("USE_MIXER", "1")))
+    mixer_eta = float(os.environ.get("MIXER_ETA", 0.1))
+    mixer_min_tokens = int(os.environ.get("MIXER_MIN_TOKENS", 10000))
 
 
 def causal_flash_or_sdpa(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
@@ -128,6 +131,10 @@ def ngram_hash_keys(tokens_np: np.ndarray, pos: np.ndarray, order: int, mask: np
     ctx_idx = (h & mask).astype(np.int64)
     full_idx = ((h ^ (tokens_np[pos].astype(np.uint64) * primes[ctx % 5])) & mask).astype(np.int64)
     return ctx_idx, full_idx
+
+def logsumexp_np(x: np.ndarray) -> float:
+    m = float(np.max(x))
+    return m + float(np.log(np.exp(x - m).sum()))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1143,6 +1150,17 @@ def eval_val_sliding_ttt(
         ngram_ctx = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
         ngram_full = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
         log0(f"ttt_sliding:ngram order={args.ngram_order} alpha=[{args.ngram_alpha_low},{args.ngram_alpha_high}] ent={args.ngram_ent_thresh}")
+    use_mixer = args.use_mixer and ngram_ctx is not None and 2 in ngram_orders
+    mixer_log_w = None
+    mixer_labels = ("blend", "neural", "unigram", "bigram", "entropy")
+    uni_counts = None
+    uni_total = 0
+    uniform_nll = math.log(args.vocab_size)
+    if use_mixer:
+        mixer_log_w = np.zeros(len(mixer_labels), dtype=np.float64)
+        mixer_log_w[0] = 2.0
+        uni_counts = np.zeros(args.vocab_size, dtype=np.uint32)
+        log0(f"ttt_sliding:mixer eta={args.mixer_eta} min_tokens={args.mixer_min_tokens}")
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1201,7 +1219,7 @@ def eval_val_sliding_ttt(
                 flat_logits = logits.reshape(-1, logits.size(-1)).float()
                 nll = F.cross_entropy(flat_logits, y_batch.reshape(-1), reduction="none").reshape(bsz, seq_len)
                 nll_np = ent_np = None
-                if ngram_ctx is not None:
+                if ngram_ctx is not None or use_mixer:
                     lp = F.log_softmax(flat_logits, dim=-1)
                     nll_np = nll.cpu().numpy()
                     ent_np = (-(lp.exp() * lp).sum(dim=-1).reshape(bsz, seq_len).cpu().numpy().astype(np.float64, copy=False))
@@ -1209,11 +1227,13 @@ def eval_val_sliding_ttt(
                     wlen = wlens[i]
                     s = 0 if ws == 0 else max(wlen - stride, 0)
                     gj = None
+                    targets_np = None
                     if ngram_ctx is not None and wlen > s:
                         gj = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
                         snll = nll_np[i, s:wlen].astype(np.float64, copy=True)
-                        smp = np.exp(-snll)
-                        bp = np.zeros(wlen - s, dtype=np.float64)
+                        neural_prob = np.exp(-snll)
+                        blend_prob = neural_prob.copy()
+                        cache_prob = np.zeros(wlen - s, dtype=np.float64)
                         hit = np.zeros(wlen - s, dtype=np.bool_)
                         for n in reversed(ngram_orders):
                             valid = (gj >= n - 1) & ~hit
@@ -1226,13 +1246,36 @@ def eval_val_sliding_ttt(
                             seen = cc >= 2.0
                             if seen.any():
                                 mi = vi[seen]
-                                bp[mi] = np.clip(np.minimum(fc[seen], cc[seen]) / np.maximum(cc[seen], 1.0), 0.0, 1.0)
+                                cache_prob[mi] = np.clip(np.minimum(fc[seen], cc[seen]) / np.maximum(cc[seen], 1.0), 0.0, 1.0)
                                 hit[mi] = True
                         if hit.any():
                             hi = np.nonzero(hit)[0]
                             aw = args.ngram_alpha_low + (args.ngram_alpha_high - args.ngram_alpha_low) / (1.0 + np.exp(-2.0 * (ent_np[i, s:wlen][hi] - args.ngram_ent_thresh)))
-                            smp[hi] = (1.0 - aw) * smp[hi] + aw * bp[hi]
-                        loss_sum += float((-np.log(np.clip(smp, 1e-12, 1.0))).sum())
+                            blend_prob[hi] = (1.0 - aw) * neural_prob[hi] + aw * cache_prob[hi]
+                        blend_nll = -np.log(np.clip(blend_prob, 1e-12, 1.0))
+                        if use_mixer and uni_total >= args.mixer_min_tokens:
+                            targets_np = val_np[gj]
+                            uni_prob = (uni_counts[targets_np].astype(np.float64) + 0.1) / (uni_total + 0.1 * args.vocab_size)
+                            ck2, fk2 = ngram_hash_keys(val_np, gj, 2, ngram_mask, ngram_primes)
+                            cc2 = ngram_ctx[2][ck2].astype(np.float64)
+                            fc2 = ngram_full[2][fk2].astype(np.float64)
+                            bi_prob = (np.minimum(fc2, cc2) + 0.1) / (cc2 + 0.1 * args.vocab_size)
+                            expert_nll = np.stack([
+                                blend_nll,
+                                snll,
+                                -np.log(np.clip(uni_prob, 1e-12, 1.0)),
+                                -np.log(np.clip(bi_prob, 1e-12, 1.0)),
+                                np.clip(ent_np[i, s:wlen], 0.0, uniform_nll),
+                            ], axis=1)
+                            log_w = mixer_log_w - logsumexp_np(mixer_log_w)
+                            mix_terms = -expert_nll + log_w[None, :]
+                            mix_max = mix_terms.max(axis=1)
+                            mixed_nll = -(mix_max + np.log(np.exp(mix_terms - mix_max[:, None]).sum(axis=1)))
+                            loss_sum += float(mixed_nll.sum())
+                            mixer_log_w -= args.mixer_eta * expert_nll.mean(axis=0)
+                            mixer_log_w -= mixer_log_w.max()
+                        else:
+                            loss_sum += float(blend_nll.sum())
                     else:
                         loss_sum += nll[i, s:wlen].to(torch.float64).sum()
                     token_count += float(wlen - s)
@@ -1241,6 +1284,11 @@ def eval_val_sliding_ttt(
                     tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     byte_count += tb.sum()
                     if ngram_ctx is not None and gj is not None:
+                        if use_mixer:
+                            if targets_np is None:
+                                targets_np = val_np[gj]
+                            np.add.at(uni_counts, targets_np, 1)
+                            uni_total += targets_np.size
                         for n in ngram_orders:
                             valid = gj >= n - 1
                             if not valid.any():
@@ -1301,6 +1349,9 @@ def eval_val_sliding_ttt(
         p.requires_grad_(True)
     base_model.eval()
 
+    if rank == 0 and mixer_log_w is not None:
+        mix_w = np.exp(mixer_log_w - logsumexp_np(mixer_log_w))
+        log0("ttt_sliding:mixer_final " + " ".join(f"{k}={v:.3f}" for k, v in zip(mixer_labels, mix_w)))
     log0(f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
          f"elapsed={time.perf_counter() - t0:.1f}s")
     return val_loss, val_bpb
