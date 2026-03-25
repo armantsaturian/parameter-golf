@@ -1,0 +1,12 @@
+commit	val_bpb	artifact_mb	status	description
+eaffbd8	1.124874	15.82	discard	XSA all 11 layers
+2d52633	1.031303	15.91	keep	Streaming 2-5gram cache in legal TTT, restore bigram 2048
+8826475	1.030806	15.90	keep	XSA all 11 layers on top of streaming 2-5gram legal TTT
+780348b	1.016610	15.90	keep	Hedge mixer online during legal TTT on top of XSA-all and streaming 2-5gram cache
+b1d6784	1.029286	15.82	discard	Depth recurrence with virtual layers 4 and 5, untied before TTT
+f062e3b	1.028825	15.96	discard	Enable value residual on top of hedge mixer TTT stack
+6791de1	0.988385	15.92	keep	Backed-off multi-order 2-5gram cache inside legal TTT on top of hedge mixer stack
+794e66d	1.100300	15.91	discard	Switch legal TTT optimizer from SGD to AdamW
+27acb98	0.000000	0.00	crash	Dedicated post-TTT cache replay, aborted mid-eval on poor trajectory
+92e8be5	0.818355	15.92	invalid	Dedicated post-TTT global cache replay leaked future n-gram stats across the second pass
+6922741	0.990946	15.91	discard	Add PPM-style exclusion to multi-order n-gram backoff
