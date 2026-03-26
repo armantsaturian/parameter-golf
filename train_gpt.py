@@ -107,6 +107,7 @@ class Hyperparameters:
     ngram_alpha_low = float(os.environ.get("NGRAM_ALPHA_LOW", 0.20))
     ngram_alpha_high = float(os.environ.get("NGRAM_ALPHA_HIGH", 0.20))
     ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", 4.0))
+    ngram_table_bits = int(os.environ.get("NGRAM_TABLE_BITS", 22))
     ngram_backoff_beta = float(os.environ.get("NGRAM_BACKOFF_BETA", 1e-6))
     ngram_logit_mix = bool(int(os.environ.get("NGRAM_LOGIT_MIX", "0")))
     use_mixer = bool(int(os.environ.get("USE_MIXER", "0")))
@@ -1072,16 +1073,18 @@ def eval_val_sliding(
     ngram_orders = list(range(2, args.ngram_order + 1))
     ngram_ctx = ngram_full = ngram_mask = ngram_primes = None
     if args.ngram_enabled and args.ngram_order >= 2:
-        ngram_mask = np.uint64((1 << 22) - 1)
+        ngram_table_size = 1 << args.ngram_table_bits
+        ngram_mask = np.uint64(ngram_table_size - 1)
         ngram_primes = np.array(
             [np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929), np.uint64(131071)],
             dtype=np.uint64,
         )
-        ngram_ctx = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
-        ngram_full = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
+        ngram_ctx = {n: np.zeros(ngram_table_size, dtype=np.uint32) for n in ngram_orders}
+        ngram_full = {n: np.zeros(ngram_table_size, dtype=np.uint32) for n in ngram_orders}
         if rank == 0:
             print(
                 f"sliding_eval:ngram order={args.ngram_order} "
+                f"table_bits={args.ngram_table_bits} "
                 f"alpha=[{args.ngram_alpha_low},{args.ngram_alpha_high}] "
                 f"ent={args.ngram_ent_thresh} backoff_beta={args.ngram_backoff_beta} "
                 f"logit_mix={int(args.ngram_logit_mix)}"
@@ -1271,12 +1274,14 @@ def eval_val_sliding_ttt(
     ngram_orders = list(range(2, args.ngram_order + 1))
     ngram_ctx = ngram_full = ngram_mask = ngram_primes = None
     if args.ngram_enabled and args.ngram_order >= 2:
-        ngram_mask = np.uint64((1 << 22) - 1)
+        ngram_table_size = 1 << args.ngram_table_bits
+        ngram_mask = np.uint64(ngram_table_size - 1)
         ngram_primes = np.array([np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929), np.uint64(131071)], dtype=np.uint64)
-        ngram_ctx = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
-        ngram_full = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
+        ngram_ctx = {n: np.zeros(ngram_table_size, dtype=np.uint32) for n in ngram_orders}
+        ngram_full = {n: np.zeros(ngram_table_size, dtype=np.uint32) for n in ngram_orders}
         log0(
             f"ttt_sliding:ngram order={args.ngram_order} "
+            f"table_bits={args.ngram_table_bits} "
             f"alpha=[{args.ngram_alpha_low},{args.ngram_alpha_high}] "
             f"ent={args.ngram_ent_thresh} backoff_beta={args.ngram_backoff_beta} "
             f"logit_mix={int(args.ngram_logit_mix)}"
