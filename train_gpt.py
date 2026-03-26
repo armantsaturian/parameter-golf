@@ -108,6 +108,7 @@ class Hyperparameters:
     ngram_alpha_high = float(os.environ.get("NGRAM_ALPHA_HIGH", 0.20))
     ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", 4.0))
     ngram_table_bits = int(os.environ.get("NGRAM_TABLE_BITS", 22))
+    ngram_prefill = bool(int(os.environ.get("NGRAM_PREFILL", "0")))
     ngram_backoff_beta = float(os.environ.get("NGRAM_BACKOFF_BETA", 1e-6))
     ngram_logit_mix = bool(int(os.environ.get("NGRAM_LOGIT_MIX", "0")))
     use_mixer = bool(int(os.environ.get("USE_MIXER", "0")))
@@ -1099,6 +1100,24 @@ def eval_val_sliding(
     ngram_total = 0
     if ngram_ctx is not None:
         uni_counts = np.zeros(args.vocab_size, dtype=np.uint32)
+        if args.ngram_prefill and my_windows:
+            first_ws = my_windows[0]
+            first_wlen = min(first_ws + seq_len, total_tokens) - first_ws
+            first_s = 0 if first_ws == 0 else max(first_wlen - stride, 0)
+            prefill_hi = first_ws + first_s + 1
+            if prefill_hi > 1:
+                prefill_gj = np.arange(1, prefill_hi, dtype=np.int64)
+                uni_counts += np.bincount(val_np[prefill_gj], minlength=args.vocab_size).astype(np.uint32)
+                uni_total = prefill_gj.size
+                for n in ngram_orders:
+                    pj = prefill_gj[max(n - 2, 0):]
+                    if pj.size == 0:
+                        continue
+                    ck, fk = ngram_hash_keys(val_np, pj, n, ngram_mask, ngram_primes)
+                    ngram_ctx[n] += np.bincount(ck, minlength=ngram_table_size).astype(np.uint32)
+                    ngram_full[n] += np.bincount(fk, minlength=ngram_table_size).astype(np.uint32)
+                if rank == 0:
+                    print(f"sliding_eval:ngram_prefill tokens={prefill_hi - 1}")
     if use_mixer:
         mixer_log_w = np.zeros(len(mixer_labels), dtype=np.float64)
         mixer_log_w[0] = 2.0
