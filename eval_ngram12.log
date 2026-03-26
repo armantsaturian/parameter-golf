@@ -1,0 +1,17 @@
+W0326 02:08:38.542000 296288 torch/distributed/run.py:766] 
+W0326 02:08:38.542000 296288 torch/distributed/run.py:766] *****************************************
+W0326 02:08:38.542000 296288 torch/distributed/run.py:766] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0326 02:08:38.542000 296288 torch/distributed/run.py:766] *****************************************
+logs/eval_ngram12.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+EVAL_ONLY=1: skipping training, loading final_model.int6.ptz
+Total submission size int6+lzma: 15911942 bytes
+final_int6_roundtrip val_loss:1.9417 val_bpb:1.1500 eval_time:9974ms
+final_int6_roundtrip_exact val_loss:1.94165191 val_bpb:1.14995563
+sliding_eval:ngram order=12 table_bits=22 alpha=[0.2,0.2] ent=4.0 backoff_beta=1e-06 logit_mix=0
+sliding_eval:ngram_hits=62007738/62023616 (100.0%)
+final_int6_sliding_window val_loss:1.4523 val_bpb:0.8601 stride:64 eval_time:181316ms
+final_int6_sliding_window_exact val_loss:1.45230336 val_bpb:0.86013813
+final_int8_zlib_roundtrip_exact val_loss:1.45230336 val_bpb:0.86013813

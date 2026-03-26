@@ -1,0 +1,62 @@
+W0325 23:50:48.122000 274574 torch/distributed/run.py:766] 
+W0325 23:50:48.122000 274574 torch/distributed/run.py:766] *****************************************
+W0325 23:50:48.122000 274574 torch/distributed/run.py:766] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0325 23:50:48.122000 274574 torch/distributed/run.py:766] *****************************************
+logs/eval_paq_pending.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+EVAL_ONLY=1: skipping training, loading final_model.int6.ptz
+Total submission size int6+lzma: 15921834 bytes
+final_int6_roundtrip val_loss:1.9399 val_bpb:1.1489 eval_time:10022ms
+final_int6_roundtrip_exact val_loss:1.93994049 val_bpb:1.14894203
+sliding_eval:ngram order=5 alpha=[0.05,0.4] ent=4.0 backoff_beta=1.0 logit_mix=1
+sliding_eval:mixer eta=0.1 min_tokens=10000
+sliding_eval:ngram_hits=62007452/62023616 (100.0%)
+sliding_eval:mixer_final blend=0.000 neural=0.000 unigram=0.000 bigram=0.000 entropy=1.000
+final_int6_sliding_window val_loss:1.8880 val_bpb:1.1182 stride:64 eval_time:132154ms
+final_int6_sliding_window_exact val_loss:1.88804874 val_bpb:1.11821177
+final_int8_zlib_roundtrip_exact val_loss:1.88804874 val_bpb:1.11821177
+ttt_sliding:start chunks=1893 chunk_tokens=32768 total_windows=969088 stride=64 ttt_lr=0.002 ttt_epochs=3 freeze_blocks=0
+ttt_sliding:ngram order=5 alpha=[0.05,0.4] ent=4.0 backoff_beta=1.0 logit_mix=1
+ttt_sliding:mixer eta=0.1 min_tokens=10000
+ttt_sliding:params unfrozen=26993756 frozen=0
+  ttt_chunk [1/1893] bpb=1.266606 time=1.8s
+  ttt_chunk [11/1893] bpb=1.102199 time=3.9s
+  ttt_chunk [21/1893] bpb=1.060965 time=6.0s
+  ttt_chunk [31/1893] bpb=1.048285 time=8.0s
+  ttt_chunk [41/1893] bpb=1.028735 time=10.1s
+  ttt_chunk [51/1893] bpb=1.018644 time=12.1s
+  ttt_chunk [61/1893] bpb=1.021043 time=14.2s
+  ttt_chunk [71/1893] bpb=1.016074 time=16.2s
+W0325 23:53:41.407000 274574 torch/distributed/elastic/agent/server/api.py:719] Received Signals.SIGTERM death signal, shutting down workers
+W0325 23:53:41.407000 274574 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 274647 closing signal SIGTERM
+W0325 23:53:41.409000 274574 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 274648 closing signal SIGTERM
+W0325 23:53:41.411000 274574 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 274649 closing signal SIGTERM
+W0325 23:53:41.412000 274574 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 274650 closing signal SIGTERM
+W0325 23:53:41.415000 274574 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 274651 closing signal SIGTERM
+W0325 23:53:41.418000 274574 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 274652 closing signal SIGTERM
+W0325 23:53:41.418000 274574 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 274653 closing signal SIGTERM
+W0325 23:53:41.420000 274574 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 274654 closing signal SIGTERM
+Traceback (most recent call last):
+  File "/usr/local/bin/torchrun", line 8, in <module>
+    sys.exit(main())
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 355, in wrapper
+    return f(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/run.py", line 892, in main
+    run(args)
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/run.py", line 883, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/launcher/api.py", line 139, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/launcher/api.py", line 261, in launch_agent
+    result = agent.run()
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/elastic/metrics/api.py", line 138, in wrapper
+    result = f(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/elastic/agent/server/api.py", line 711, in run
+    result = self._invoke_run(role)
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/elastic/agent/server/api.py", line 870, in _invoke_run
+    time.sleep(monitor_interval)
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/elastic/multiprocessing/api.py", line 84, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 274574 got signal: 15

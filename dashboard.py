@@ -18,6 +18,14 @@ PORT = 8080
 REPO_DIR = os.environ.get("REPO_DIR", os.path.expanduser("~/parameter-golf"))
 RESULTS_TSV = os.path.join(REPO_DIR, "results.tsv")
 RUN_LOG = os.path.join(REPO_DIR, "run.log")
+RUN_LOG_RECENT_SECONDS = int(os.environ.get("RUN_LOG_RECENT_SECONDS", "300"))
+FINAL_METRIC_PREFIXES = (
+    "final_int6_roundtrip_exact",
+    "final_int6_sliding_window_exact",
+    "final_int8_zlib_roundtrip_exact",
+    "legal_ttt_exact",
+    "legal_ttt ",
+)
 
 
 def parse_results_tsv():
@@ -43,38 +51,56 @@ def parse_results_tsv():
     return experiments
 
 
+def empty_run_data():
+    return {
+        "train_steps": [],
+        "val_checks": [],
+        "ttt_chunks": [],
+        "sliding_eval": [],
+        "diagnostics": [],
+        "final_metrics": {},
+        "wallclock_stopped": None,
+        "eval_only": False,
+        "ttt_started": None,
+        "completed": False,
+        "crashed": False,
+        "log_mtime": None,
+    }
+
+
 def parse_run_log():
-    """Parse current run.log for training steps, TTT chunks, and final metrics."""
-    train_steps = []
-    val_checks = []
-    ttt_chunks = []
-    diagnostics = []
-    final_metrics = {}
-    current_step = 0
-    wallclock_stopped = None
+    """Parse current run.log for training, eval progress, and final metrics."""
+    run_data = empty_run_data()
+    ttt_finished = False
 
     if not os.path.exists(RUN_LOG):
-        return {"train_steps": [], "val_checks": [], "ttt_chunks": [], "diagnostics": [], "final_metrics": {}, "wallclock_stopped": None}
+        return run_data
+
+    run_data["log_mtime"] = os.path.getmtime(RUN_LOG)
 
     with open(RUN_LOG) as f:
         for line in f:
             line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith("EVAL_ONLY=1:"):
+                run_data["eval_only"] = True
 
             # Training steps
             m = re.match(r"step:(\d+)/(\d+)\s+train_loss:([\d.]+)\s+train_time:(\d+)ms", line)
             if m:
-                train_steps.append({
+                run_data["train_steps"].append({
                     "step": int(m.group(1)),
                     "total": int(m.group(2)),
                     "loss": float(m.group(3)),
                     "time_ms": int(m.group(4)),
                 })
-                current_step = int(m.group(1))
 
             # Val checks during training
             m = re.match(r"step:(\d+)/(\d+)\s+val_loss:([\d.]+)\s+val_bpb:([\d.]+)", line)
             if m:
-                val_checks.append({
+                run_data["val_checks"].append({
                     "step": int(m.group(1)),
                     "val_loss": float(m.group(3)),
                     "val_bpb": float(m.group(4)),
@@ -83,57 +109,99 @@ def parse_run_log():
             # TTT chunks
             m = re.match(r"\s*ttt_chunk\s*\[(\d+)/(\d+)\]\s*bpb=([\d.]+)\s*time=([\d.]+)s", line)
             if m:
-                ttt_chunks.append({
+                run_data["ttt_chunks"].append({
                     "chunk": int(m.group(1)),
                     "total": int(m.group(2)),
                     "bpb": float(m.group(3)),
                     "time_s": float(m.group(4)),
                 })
 
+            # Sliding eval progress (prepare.py / eval-only progress)
+            m = re.match(r"\s*sliding_eval\s*\[\s*([\d.]+)%\]\s*(\d+)/(\d+)\s+windows\s+running_bpb=([\d.]+)", line)
+            if m:
+                run_data["sliding_eval"].append({
+                    "pct": float(m.group(1)),
+                    "done": int(m.group(2)),
+                    "total": int(m.group(3)),
+                    "bpb": float(m.group(4)),
+                })
+
+            # TTT config/start
+            m = re.match(r"ttt_sliding:start chunks=(\d+)\s+chunk_tokens=(\d+)\s+total_windows=(\d+)\s+stride=(\d+)", line)
+            if m:
+                run_data["ttt_started"] = {
+                    "chunks": int(m.group(1)),
+                    "chunk_tokens": int(m.group(2)),
+                    "total_windows": int(m.group(3)),
+                    "stride": int(m.group(4)),
+                }
+
             # Wallclock stop
             if "stopping_early" in line or "wallclock_cap" in line:
                 m2 = re.search(r"step:(\d+)", line)
                 if m2:
-                    wallclock_stopped = int(m2.group(1))
+                    run_data["wallclock_stopped"] = int(m2.group(1))
 
             # Diagnostic lines
             if "DIAGNOSTIC" in line:
                 m = re.search(r"val_bpb:([\d.]+)", line)
                 if m:
-                    diagnostics.append({"label": "post_ema", "val_bpb": float(m.group(1))})
+                    run_data["diagnostics"].append({"label": "post_ema", "val_bpb": float(m.group(1))})
 
             # Final metrics
-            for prefix in ["final_int6_roundtrip_exact", "final_int6_sliding_window_exact",
-                           "final_int8_zlib_roundtrip_exact", "legal_ttt_exact", "legal_ttt "]:
+            for prefix in FINAL_METRIC_PREFIXES:
                 if line.startswith(prefix.strip()):
                     m = re.search(r"val_bpb:([\d.]+)", line)
                     if m:
                         key = prefix.strip().replace(" ", "_")
-                        final_metrics[key] = float(m.group(1))
+                        run_data["final_metrics"][key] = float(m.group(1))
 
             # Submission size
             m = re.search(r"Total submission size.*?:\s*(\d+)\s*bytes", line)
             if m:
-                final_metrics["artifact_bytes"] = int(m.group(1))
+                run_data["final_metrics"]["artifact_bytes"] = int(m.group(1))
 
             # SWA/QAT events
             if line.startswith("swa:start"):
                 m2 = re.search(r"step:(\d+)", line)
                 if m2:
-                    diagnostics.append({"label": "swa_start", "step": int(m2.group(1))})
+                    run_data["diagnostics"].append({"label": "swa_start", "step": int(m2.group(1))})
             if line.startswith("late_qat:enabled"):
                 m2 = re.search(r"step:(\d+)", line)
                 if m2:
-                    diagnostics.append({"label": "qat_start", "step": int(m2.group(1))})
+                    run_data["diagnostics"].append({"label": "qat_start", "step": int(m2.group(1))})
 
-    return {
-        "train_steps": train_steps,
-        "val_checks": val_checks,
-        "ttt_chunks": ttt_chunks,
-        "diagnostics": diagnostics,
-        "final_metrics": final_metrics,
-        "wallclock_stopped": wallclock_stopped,
-    }
+            if line.startswith("ttt_sliding:done"):
+                ttt_finished = True
+
+            if line.startswith("Traceback (most recent call last):") or "ChildFailedError" in line:
+                run_data["crashed"] = True
+
+    if run_data["ttt_started"]:
+        run_data["completed"] = (
+            ttt_finished
+            or "legal_ttt_exact" in run_data["final_metrics"]
+            or "legal_ttt" in run_data["final_metrics"]
+        )
+    elif run_data["eval_only"]:
+        run_data["completed"] = (
+            "final_int8_zlib_roundtrip_exact" in run_data["final_metrics"]
+            or "legal_ttt_exact" in run_data["final_metrics"]
+            or "legal_ttt" in run_data["final_metrics"]
+        )
+    else:
+        run_data["completed"] = any(
+            key in run_data["final_metrics"]
+            for key in (
+                "final_int6_roundtrip_exact",
+                "final_int6_sliding_window_exact",
+                "final_int8_zlib_roundtrip_exact",
+                "legal_ttt_exact",
+                "legal_ttt",
+            )
+        )
+
+    return run_data
 
 
 def get_git_log():
@@ -168,23 +236,55 @@ def get_disk_usage():
         return "?"
 
 
-def is_running():
-    """Check if a training run is currently active."""
+def get_active_run_process():
+    """Return the active training/eval command if one is running."""
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "torchrun.*train_gpt"],
-            capture_output=True, text=True, timeout=5
-        )
-        return bool(result.stdout.strip())
+        result = subprocess.run(["pgrep", "-af", "train_gpt.py|launch_train_gcp_h100.sh"], capture_output=True, text=True, timeout=5)
+        for line in result.stdout.strip().splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            cmd = parts[1]
+            if "dashboard.py" in cmd:
+                continue
+            if "train_gpt.py" not in cmd and "launch_train_gcp_h100.sh" not in cmd:
+                continue
+            if not any(token in cmd for token in ("torchrun", "python", "timeout", "launch_train_gcp_h100.sh")):
+                continue
+            return {"pid": int(parts[0]), "command": cmd}
+        return None
     except Exception:
+        return None
+
+
+def is_running(run_data=None):
+    """Check if a training/eval run is currently active."""
+    if get_active_run_process():
+        return True
+
+    if run_data is None:
+        run_data = parse_run_log()
+
+    if not run_data["log_mtime"]:
         return False
+
+    recently_updated = (time.time() - run_data["log_mtime"]) <= RUN_LOG_RECENT_SECONDS
+    has_progress_signal = bool(
+        run_data["train_steps"]
+        or run_data["val_checks"]
+        or run_data["ttt_chunks"]
+        or run_data["sliding_eval"]
+        or run_data["eval_only"]
+        or run_data["ttt_started"]
+    )
+    return recently_updated and has_progress_signal and not run_data["completed"] and not run_data["crashed"]
 
 
 def build_html():
     experiments = parse_results_tsv()
     run_data = parse_run_log()
     commits = get_git_log()
-    running = is_running()
+    running = is_running(run_data)
     now = time.strftime("%Y-%m-%d %H:%M:%S")
 
     # Compute waterfall from final metrics
@@ -206,6 +306,8 @@ def build_html():
     # Best result
     valid = [e for e in experiments if e["val_bpb"] and e["status"] in ("keep",)]
     best = min(valid, key=lambda x: x["val_bpb"]) if valid else None
+    best_bpb = f"{best['val_bpb']:.4f}" if best else "N/A"
+    best_desc = f"{best['description'][:40]}..." if best else "No valid runs yet"
 
     # Status badge
     if running:
@@ -213,20 +315,77 @@ def build_html():
             last_chunk = run_data["ttt_chunks"][-1]
             status_text = f"EVAL/TTT in progress - chunk {last_chunk['chunk']}/{last_chunk['total']} - bpb {last_chunk['bpb']:.4f}"
             status_color = "#f59e0b"
+        elif run_data["sliding_eval"]:
+            last_eval = run_data["sliding_eval"][-1]
+            status_text = f"EVAL in progress - windows {last_eval['done']}/{last_eval['total']} - bpb {last_eval['bpb']:.4f}"
+            status_color = "#f59e0b"
+        elif run_data["ttt_started"]:
+            status_text = f"EVAL/TTT starting - 0/{run_data['ttt_started']['chunks']} chunks"
+            status_color = "#8b5cf6"
         elif run_data["train_steps"]:
             last_step = run_data["train_steps"][-1]
             status_text = f"TRAINING in progress - step {last_step['step']}/{last_step['total']} - loss {last_step['loss']:.4f}"
             status_color = "#3b82f6"
+        elif run_data["eval_only"]:
+            status_text = "EVAL_ONLY loading artifact"
+            status_color = "#8b5cf6"
         else:
             status_text = "RUN STARTING..."
             status_color = "#8b5cf6"
     else:
-        if fm:
+        if run_data["crashed"]:
+            status_text = "ERROR - last run crashed"
+            status_color = "#ef4444"
+        elif fm and run_data["completed"]:
             status_text = "IDLE - last run complete"
             status_color = "#10b981"
+        elif run_data["ttt_chunks"]:
+            last_chunk = run_data["ttt_chunks"][-1]
+            status_text = f"IDLE - last eval stopped at chunk {last_chunk['chunk']}/{last_chunk['total']}"
+            status_color = "#f97316"
+        elif run_data["sliding_eval"]:
+            last_eval = run_data["sliding_eval"][-1]
+            status_text = f"IDLE - last eval stopped at windows {last_eval['done']}/{last_eval['total']}"
+            status_color = "#f97316"
+        elif run_data["eval_only"] or run_data["ttt_started"]:
+            status_text = "IDLE - last eval incomplete"
+            status_color = "#f97316"
         else:
             status_text = "IDLE - no run data"
             status_color = "#6b7280"
+
+    progress_points = []
+    progress_name = "BPB"
+    progress_x_title = "Eval Chunk"
+    progress_hover = "Chunk %{x}<br>BPB: %{y:.4f}<br>Time: %{customdata:.0f}s"
+    progress_x = []
+    progress_y = []
+    progress_customdata = []
+    if run_data["ttt_chunks"]:
+        progress_points = run_data["ttt_chunks"]
+        progress_name = "TTT BPB"
+        progress_x = [t["chunk"] for t in progress_points]
+        progress_y = [t["bpb"] for t in progress_points]
+        progress_customdata = [t["time_s"] for t in progress_points]
+    elif run_data["sliding_eval"]:
+        progress_points = run_data["sliding_eval"]
+        progress_name = "Eval BPB"
+        progress_x_title = "Windows Scored"
+        progress_x = [p["done"] for p in progress_points]
+        progress_y = [p["bpb"] for p in progress_points]
+        progress_customdata = [p["pct"] for p in progress_points]
+        progress_hover = (
+            f"Windows %{{x}}/{progress_points[-1]['total']}<br>"
+            "BPB: %{y:.4f}<br>Done: %{customdata:.1f}%"
+        )
+
+    waterfall_bpb = [w["bpb"] for w in waterfall]
+    waterfall_range = [min(waterfall_bpb) - 0.02, max(waterfall_bpb) + 0.02] if waterfall_bpb else [0, 1]
+    waterfall_annotations = (
+        []
+        if waterfall_bpb
+        else [{"text": "No completed eval stage yet", "xref": "paper", "yref": "paper", "x": 0.5, "y": 0.5, "showarrow": False, "font": {"size": 12, "color": "#64748b"}}]
+    )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -281,8 +440,8 @@ def build_html():
 <div class="stats">
   <div class="stat-card">
     <div class="label">Best BPB</div>
-    <div class="value" style="color:#10b981">{best['val_bpb']:.4f if best else 'N/A'}</div>
-    <div class="sub">{best['description'][:40] if best else 'No valid runs yet'}...</div>
+    <div class="value" style="color:#10b981">{best_bpb}</div>
+    <div class="sub">{best_desc}</div>
   </div>
   <div class="stat-card">
     <div class="label">Total Experiments</div>
@@ -455,18 +614,18 @@ Plotly.newPlot('train-loss', [
 """
 
     # TTT progression
-    ttt = run_data["ttt_chunks"]
     html += f"""
-var ttt_x = {json.dumps([t['chunk'] for t in ttt])};
-var ttt_y = {json.dumps([t['bpb'] for t in ttt])};
-var ttt_time = {json.dumps([t['time_s'] for t in ttt])};
+var progress_x = {json.dumps(progress_x)};
+var progress_y = {json.dumps(progress_y)};
+var progress_customdata = {json.dumps(progress_customdata)};
+var progress_hover = {json.dumps(progress_hover)};
 
 Plotly.newPlot('ttt-progress', [
-  {{x: ttt_x, y: ttt_y, mode: 'lines', name: 'BPB', line: {{color: '#10b981', width: 2}},
-    hovertemplate: 'Chunk %{{x}}<br>BPB: %{{y:.4f}}<br>Time: %{{customdata:.0f}}s', customdata: ttt_time}},
+  {{x: progress_x, y: progress_y, mode: 'lines', name: {json.dumps(progress_name)}, line: {{color: '#10b981', width: 2}},
+    hovertemplate: progress_hover, customdata: progress_customdata}},
 ], {{
   ...layout_base,
-  xaxis: {{...layout_base.xaxis, title: 'Eval Chunk'}},
+  xaxis: {{...layout_base.xaxis, title: {json.dumps(progress_x_title)}}},
   yaxis: {{...layout_base.yaxis, title: 'Running BPB'}},
 }});
 """
@@ -474,7 +633,7 @@ Plotly.newPlot('ttt-progress', [
     # Waterfall
     html += f"""
 var wf_stages = {json.dumps([w['stage'] for w in waterfall])};
-var wf_bpb = {json.dumps([w['bpb'] for w in waterfall])};
+var wf_bpb = {json.dumps(waterfall_bpb)};
 var wf_colors = wf_bpb.map((v, i) => i === wf_bpb.length - 1 ? '#10b981' : (i > 0 && v < wf_bpb[i-1] ? '#3b82f6' : '#ef4444'));
 
 Plotly.newPlot('waterfall', [
@@ -483,12 +642,14 @@ Plotly.newPlot('waterfall', [
 ], {{
   ...layout_base,
   xaxis: {{...layout_base.xaxis}},
-  yaxis: {{...layout_base.yaxis, title: 'BPB', range: [Math.min(...wf_bpb) - 0.02, Math.max(...wf_bpb) + 0.02]}},
+  yaxis: {{...layout_base.yaxis, title: 'BPB', range: {json.dumps(waterfall_range)}}},
+  annotations: {json.dumps(waterfall_annotations)},
 }});
 """
 
     # Size vs BPB scatter
     sized_exps = [e for e in experiments if e["val_bpb"] and e["artifact_mb"]]
+    size_limit_y = max((e["val_bpb"] for e in sized_exps if e["val_bpb"] > 0), default=1.2)
     html += f"""
 var sb_x = {json.dumps([e['artifact_mb'] for e in sized_exps])};
 var sb_y = {json.dumps([e['val_bpb'] for e in sized_exps])};
@@ -503,7 +664,7 @@ Plotly.newPlot('size-bpb', [
   xaxis: {{...layout_base.xaxis, title: 'Artifact Size (MB)', range: [0, 17]}},
   yaxis: {{...layout_base.yaxis, title: 'val_bpb'}},
   shapes: [{{type:'line', x0:16, x1:16, y0:0, y1:2, line:{{color:'#ef4444', dash:'dash', width:2}}}}],
-  annotations: [{{x:16, y: Math.max(...sb_y.filter(v => v > 0)) || 1.2, text:'16MB limit', showarrow:false, font:{{size:10, color:'#ef4444'}}, xshift:-30}}],
+  annotations: [{{x:16, y: {size_limit_y}, text:'16MB limit', showarrow:false, font:{{size:10, color:'#ef4444'}}, xshift:-30}}],
 }});
 </script>
 
