@@ -94,7 +94,7 @@ class Hyperparameters:
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
     eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
@@ -103,12 +103,13 @@ class Hyperparameters:
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
-    ngram_order = int(os.environ.get("NGRAM_ORDER", 5))
-    ngram_alpha_low = float(os.environ.get("NGRAM_ALPHA_LOW", 0.05))
-    ngram_alpha_high = float(os.environ.get("NGRAM_ALPHA_HIGH", 0.40))
+    ngram_order = int(os.environ.get("NGRAM_ORDER", 7))
+    ngram_alpha_low = float(os.environ.get("NGRAM_ALPHA_LOW", 0.20))
+    ngram_alpha_high = float(os.environ.get("NGRAM_ALPHA_HIGH", 0.20))
     ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", 4.0))
-    ngram_backoff_beta = float(os.environ.get("NGRAM_BACKOFF_BETA", 1.0))
-    use_mixer = bool(int(os.environ.get("USE_MIXER", "1")))
+    ngram_backoff_beta = float(os.environ.get("NGRAM_BACKOFF_BETA", 1e-6))
+    ngram_logit_mix = bool(int(os.environ.get("NGRAM_LOGIT_MIX", "0")))
+    use_mixer = bool(int(os.environ.get("USE_MIXER", "0")))
     mixer_eta = float(os.environ.get("MIXER_ETA", 0.1))
     mixer_min_tokens = int(os.environ.get("MIXER_MIN_TOKENS", 10000))
 
@@ -1053,7 +1054,7 @@ def eval_val_sliding(
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
 ) -> tuple[float, float]:
-    """Sliding window evaluation: each token scored with maximum context."""
+    """Sliding window evaluation with optional streaming n-gram cache."""
     seq_len = eval_seq_len or args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     window_starts = [ws for ws in range(0, total_tokens, stride)
@@ -1067,6 +1068,39 @@ def eval_val_sliding(
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    val_np = val_tokens.numpy()
+    ngram_orders = list(range(2, args.ngram_order + 1))
+    ngram_ctx = ngram_full = ngram_mask = ngram_primes = None
+    if args.ngram_enabled and args.ngram_order >= 2:
+        ngram_mask = np.uint64((1 << 22) - 1)
+        ngram_primes = np.array(
+            [np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929), np.uint64(131071)],
+            dtype=np.uint64,
+        )
+        ngram_ctx = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
+        ngram_full = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
+        if rank == 0:
+            print(
+                f"sliding_eval:ngram order={args.ngram_order} "
+                f"alpha=[{args.ngram_alpha_low},{args.ngram_alpha_high}] "
+                f"ent={args.ngram_ent_thresh} backoff_beta={args.ngram_backoff_beta} "
+                f"logit_mix={int(args.ngram_logit_mix)}"
+            )
+    use_mixer = args.use_mixer and ngram_ctx is not None and 2 in ngram_orders
+    mixer_log_w = None
+    mixer_labels = ("blend", "neural", "unigram", "bigram", "entropy")
+    uni_counts = None
+    uni_total = 0
+    uniform_nll = math.log(args.vocab_size)
+    ngram_hits = 0
+    ngram_total = 0
+    if ngram_ctx is not None:
+        uni_counts = np.zeros(args.vocab_size, dtype=np.uint32)
+    if use_mixer:
+        mixer_log_w = np.zeros(len(mixer_labels), dtype=np.float64)
+        mixer_log_w[0] = 2.0
+        if rank == 0:
+            print(f"sliding_eval:mixer eta={args.mixer_eta} min_tokens={args.mixer_min_tokens}")
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1083,26 +1117,116 @@ def eval_val_sliding(
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = compiled_logits(x_batch)
-            nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                y_batch.reshape(-1),
-                reduction="none",
-            ).reshape(bsz, seq_len)
+            flat_logits = logits.reshape(-1, logits.size(-1)).float()
+            nll = F.cross_entropy(flat_logits, y_batch.reshape(-1), reduction="none").reshape(bsz, seq_len)
+            nll_np = ent_np = None
+            if ngram_ctx is not None or use_mixer:
+                lp = F.log_softmax(flat_logits, dim=-1)
+                nll_np = nll.cpu().numpy()
+                ent_np = (-(lp.exp() * lp).sum(dim=-1).reshape(bsz, seq_len).cpu().numpy().astype(np.float64, copy=False))
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
-                scored_nll = nll[i, s:wlen].to(torch.float64)
-                loss_sum += scored_nll.sum()
+                gj = None
+                targets_np = None
+                if ngram_ctx is not None and wlen > s:
+                    gj = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
+                    snll = nll_np[i, s:wlen].astype(np.float64, copy=True)
+                    neural_prob = np.exp(-snll)
+                    blend_prob = neural_prob.copy()
+                    targets_np = val_np[gj]
+                    uni_prob = (uni_counts[targets_np].astype(np.float64) + 0.1) / (uni_total + 0.1 * args.vocab_size)
+                    cache_prob = uni_prob.copy()
+                    hit = np.zeros(wlen - s, dtype=np.bool_)
+                    for n in ngram_orders:
+                        valid = gj >= n - 1
+                        if not valid.any():
+                            continue
+                        vi = np.nonzero(valid)[0]
+                        ck, fk = ngram_hash_keys(val_np, gj[vi], n, ngram_mask, ngram_primes)
+                        cc = ngram_ctx[n][ck].astype(np.float64)
+                        fc = ngram_full[n][fk].astype(np.float64)
+                        prev = cache_prob[vi]
+                        cache_prob[vi] = np.clip(
+                            (np.minimum(fc, cc) + args.ngram_backoff_beta * prev) /
+                            (cc + args.ngram_backoff_beta),
+                            0.0,
+                            1.0,
+                        )
+                        hit[vi] |= cc >= 2.0
+                    ngram_hits += int(hit.sum())
+                    ngram_total += hit.size
+                    if hit.any():
+                        hi = np.nonzero(hit)[0]
+                        aw = args.ngram_alpha_low + (args.ngram_alpha_high - args.ngram_alpha_low) / (
+                            1.0 + np.exp(-2.0 * (ent_np[i, s:wlen][hi] - args.ngram_ent_thresh))
+                        )
+                        if args.ngram_logit_mix:
+                            np_clip = np.clip(neural_prob[hi], 1e-7, 1.0 - 1e-7)
+                            cp_clip = np.clip(cache_prob[hi], 1e-7, 1.0 - 1e-7)
+                            lo_n = np.log(np_clip / (1.0 - np_clip))
+                            lo_c = np.log(cp_clip / (1.0 - cp_clip))
+                            lo_mix = (1.0 - aw) * lo_n + aw * lo_c
+                            blend_prob[hi] = 1.0 / (1.0 + np.exp(-lo_mix))
+                        else:
+                            blend_prob[hi] = (1.0 - aw) * neural_prob[hi] + aw * cache_prob[hi]
+                    blend_nll = -np.log(np.clip(blend_prob, 1e-12, 1.0))
+                    if use_mixer and uni_total >= args.mixer_min_tokens:
+                        ck2, fk2 = ngram_hash_keys(val_np, gj, 2, ngram_mask, ngram_primes)
+                        cc2 = ngram_ctx[2][ck2].astype(np.float64)
+                        fc2 = ngram_full[2][fk2].astype(np.float64)
+                        bi_prob = (np.minimum(fc2, cc2) + 0.1) / (cc2 + 0.1 * args.vocab_size)
+                        expert_nll = np.stack([
+                            blend_nll,
+                            snll,
+                            -np.log(np.clip(uni_prob, 1e-12, 1.0)),
+                            -np.log(np.clip(bi_prob, 1e-12, 1.0)),
+                            np.clip(ent_np[i, s:wlen], 0.0, uniform_nll),
+                        ], axis=1)
+                        log_w = mixer_log_w - logsumexp_np(mixer_log_w)
+                        mix_terms = -expert_nll + log_w[None, :]
+                        mix_max = mix_terms.max(axis=1)
+                        mixed_nll = -(mix_max + np.log(np.exp(mix_terms - mix_max[:, None]).sum(axis=1)))
+                        loss_sum += float(mixed_nll.sum())
+                        mixer_log_w -= args.mixer_eta * expert_nll.mean(axis=0)
+                        mixer_log_w -= mixer_log_w.max()
+                    else:
+                        loss_sum += float(blend_nll.sum())
+                else:
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    if ngram_ctx is not None:
+                        ngram_total += wlen - s
                 token_count += float(wlen - s)
                 tgt = y_batch[i, s:wlen]
                 prev = x_batch[i, s:wlen]
                 tb = base_bytes_lut[tgt].to(torch.float64)
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                 byte_count += tb.sum()
+                if ngram_ctx is not None and gj is not None:
+                    np.add.at(uni_counts, targets_np, 1)
+                    uni_total += targets_np.size
+                    for n in ngram_orders:
+                        valid = gj >= n - 1
+                        if not valid.any():
+                            continue
+                        ck, fk = ngram_hash_keys(val_np, gj[valid], n, ngram_mask, ngram_primes)
+                        np.add.at(ngram_ctx[n], ck, 1)
+                        np.add.at(ngram_full[n], fk, 1)
+    hit_stats = torch.tensor((float(ngram_hits), float(ngram_total)), device=device, dtype=torch.float64)
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(hit_stats, op=dist.ReduceOp.SUM)
+    if rank == 0 and hit_stats[1].item() > 0:
+        print(
+            f"sliding_eval:ngram_hits={int(hit_stats[0].item())}/{int(hit_stats[1].item())} "
+            f"({100.0 * hit_stats[0].item() / hit_stats[1].item():.1f}%)"
+        )
+    if rank == 0 and mixer_log_w is not None:
+        mix_w = np.exp(mixer_log_w - logsumexp_np(mixer_log_w))
+        print("sliding_eval:mixer_final " + " ".join(f"{k}={v:.3f}" for k, v in zip(mixer_labels, mix_w)))
     val_loss = (loss_sum / token_count).item()
     bits_per_token = val_loss / math.log(2.0)
     tokens_per_byte = token_count.item() / byte_count.item()
@@ -1151,7 +1275,12 @@ def eval_val_sliding_ttt(
         ngram_primes = np.array([np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929), np.uint64(131071)], dtype=np.uint64)
         ngram_ctx = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
         ngram_full = {n: np.zeros(1 << 22, dtype=np.uint32) for n in ngram_orders}
-        log0(f"ttt_sliding:ngram order={args.ngram_order} alpha=[{args.ngram_alpha_low},{args.ngram_alpha_high}] ent={args.ngram_ent_thresh} backoff_beta={args.ngram_backoff_beta}")
+        log0(
+            f"ttt_sliding:ngram order={args.ngram_order} "
+            f"alpha=[{args.ngram_alpha_low},{args.ngram_alpha_high}] "
+            f"ent={args.ngram_ent_thresh} backoff_beta={args.ngram_backoff_beta} "
+            f"logit_mix={int(args.ngram_logit_mix)}"
+        )
     use_mixer = args.use_mixer and ngram_ctx is not None and 2 in ngram_orders
     mixer_log_w = None
     mixer_labels = ("blend", "neural", "unigram", "bigram", "entropy")
@@ -1260,13 +1389,15 @@ def eval_val_sliding_ttt(
                         if hit.any():
                             hi = np.nonzero(hit)[0]
                             aw = args.ngram_alpha_low + (args.ngram_alpha_high - args.ngram_alpha_low) / (1.0 + np.exp(-2.0 * (ent_np[i, s:wlen][hi] - args.ngram_ent_thresh)))
-                            # PAQ-style log-odds mixing
-                            np_clip = np.clip(neural_prob[hi], 1e-7, 1.0 - 1e-7)
-                            cp_clip = np.clip(cache_prob[hi], 1e-7, 1.0 - 1e-7)
-                            lo_n = np.log(np_clip / (1.0 - np_clip))
-                            lo_c = np.log(cp_clip / (1.0 - cp_clip))
-                            lo_mix = (1.0 - aw) * lo_n + aw * lo_c
-                            blend_prob[hi] = 1.0 / (1.0 + np.exp(-lo_mix))
+                            if args.ngram_logit_mix:
+                                np_clip = np.clip(neural_prob[hi], 1e-7, 1.0 - 1e-7)
+                                cp_clip = np.clip(cache_prob[hi], 1e-7, 1.0 - 1e-7)
+                                lo_n = np.log(np_clip / (1.0 - np_clip))
+                                lo_c = np.log(cp_clip / (1.0 - cp_clip))
+                                lo_mix = (1.0 - aw) * lo_n + aw * lo_c
+                                blend_prob[hi] = 1.0 / (1.0 + np.exp(-lo_mix))
+                            else:
+                                blend_prob[hi] = (1.0 - aw) * neural_prob[hi] + aw * cache_prob[hi]
                         blend_nll = -np.log(np.clip(blend_prob, 1e-12, 1.0))
                         if use_mixer and uni_total >= args.mixer_min_tokens:
                             ck2, fk2 = ngram_hash_keys(val_np, gj, 2, ngram_mask, ngram_primes)
@@ -1367,6 +1498,82 @@ def eval_val_sliding_ttt(
     log0(f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
          f"elapsed={time.perf_counter() - t0:.1f}s")
     return val_loss, val_bpb
+
+
+def run_final_evals(
+    args: Hyperparameters,
+    eval_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    effective_eval_seq_len: int,
+    log0=print,
+) -> None:
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    torch.cuda.synchronize()
+    t_qeval = time.perf_counter()
+    q_val_loss, q_val_bpb = eval_val(
+        args, compiled_eval, rank, world_size, device, grad_accum_steps,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        eval_seq_len=effective_eval_seq_len,
+    )
+    torch.cuda.synchronize()
+    log0(
+        f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+    )
+    log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    sw_seq_len = effective_eval_seq_len
+    if args.eval_stride > 0 and args.eval_stride <= sw_seq_len:
+        torch.cuda.synchronize()
+        t_slide = time.perf_counter()
+        sw_val_loss, sw_val_bpb = eval_val_sliding(
+            args, eval_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride,
+            eval_seq_len=sw_seq_len,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+            f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
+        )
+        log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+    if args.eval_stride != 64 and 64 < sw_seq_len:
+        torch.cuda.synchronize()
+        t_slide64 = time.perf_counter()
+        sw64_val_loss, sw64_val_bpb = eval_val_sliding(
+            args, eval_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=64,
+            eval_seq_len=sw_seq_len,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int6_sliding_window_s64 val_loss:{sw64_val_loss:.4f} val_bpb:{sw64_val_bpb:.4f} "
+            f"stride:64 eval_time:{1000.0 * (time.perf_counter() - t_slide64):.0f}ms"
+        )
+        log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+    if args.ttt_enabled:
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_loss, ttt_bpb = eval_val_sliding_ttt(
+            args, eval_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride, log0=log0,
+        )
+        torch.cuda.synchronize()
+        log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
+             f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
+        log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
 
 
 # --- GPTQ-lite int6 quantization ---
@@ -1631,19 +1838,11 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         quant_file_bytes = len(quant_blob_disk)
         log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
-        if args.ttt_enabled:
-            torch.cuda.synchronize()
-            t_ttt = time.perf_counter()
-            ttt_loss, ttt_bpb = eval_val_sliding_ttt(
-                args, eval_model, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                stride=args.eval_stride, log0=log0,
-            )
-            torch.cuda.synchronize()
-            log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
-                 f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
-            log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
-            log0(f"final_int8_zlib_roundtrip_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        run_final_evals(
+            args, eval_model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            effective_eval_seq_len, log0=log0,
+        )
         if distributed:
             dist.destroy_process_group()
         return
@@ -2026,67 +2225,11 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args, compiled_eval, rank, world_size, device, grad_accum_steps,
+    run_final_evals(
+        args, eval_model, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        eval_seq_len=effective_eval_seq_len,
+        effective_eval_seq_len, log0=log0,
     )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-    sw_seq_len = effective_eval_seq_len
-    if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
-        torch.cuda.synchronize()
-        t_slide = time.perf_counter()
-        sw_val_loss, sw_val_bpb = eval_val_sliding(
-            args, eval_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride,
-            eval_seq_len=sw_seq_len,
-        )
-        torch.cuda.synchronize()
-        log0(
-            f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
-            f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
-        )
-        log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
-        log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
-    if args.eval_stride != 64 and 64 < sw_seq_len:
-        torch.cuda.synchronize()
-        t_slide64 = time.perf_counter()
-        sw64_val_loss, sw64_val_bpb = eval_val_sliding(
-            args, eval_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=64,
-            eval_seq_len=sw_seq_len,
-        )
-        torch.cuda.synchronize()
-        log0(
-            f"final_int6_sliding_window_s64 val_loss:{sw64_val_loss:.4f} val_bpb:{sw64_val_bpb:.4f} "
-            f"stride:64 eval_time:{1000.0 * (time.perf_counter() - t_slide64):.0f}ms"
-        )
-        log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
-        log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
-    # Legal score-first TTT (PR #461 recipe)
-    if args.ttt_enabled:
-        torch.cuda.synchronize()
-        t_ttt = time.perf_counter()
-        ttt_loss, ttt_bpb = eval_val_sliding_ttt(
-            args, eval_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, log0=log0,
-        )
-        torch.cuda.synchronize()
-        log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
-             f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
-        log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
-        log0(f"final_int8_zlib_roundtrip_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
